@@ -1,0 +1,114 @@
+name: Rebuild on New Synapse Stable Release
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # Runs daily at midnight
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - '.github/last-digest.txt'
+      - '.github/update-summary.md'
+
+jobs:
+  check_and_build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Need write permission to commit changes
+      packages: write  # Need write permission to push to GitHub Packages
+    
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get Docker image digest
+        run: |
+          # Enable Docker CLI experimental features
+          mkdir -p ~/.docker
+          echo '{"experimental": "enabled"}' > ~/.docker/config.json
+          
+          # Pull the latest image first to ensure we can access it
+          docker pull docker.io/matrixdotorg/synapse:latest
+          
+          # Get the Docker image digest
+          DOCKER_DIGEST=$(docker inspect docker.io/matrixdotorg/synapse:latest --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
+          echo "Docker digest: $DOCKER_DIGEST"
+          echo "DOCKER_DIGEST=$DOCKER_DIGEST" >> $GITHUB_ENV
+
+      - name: Read previous digest from file
+        id: previous-digest
+        run: |
+          if [ -f .github/last-digest.txt ]; then
+            PREVIOUS_DIGEST=$(cat .github/last-digest.txt)
+            echo "value=$PREVIOUS_DIGEST" >> $GITHUB_OUTPUT
+          else
+            echo "value=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Set package name
+        shell: bash
+        run: echo "PACKAGE_NAME=synapse" >> $GITHUB_ENV
+        
+      - name: Check for base image changes and build if needed
+        run: |
+          # Skip if the commit message indicates it's from the workflow itself
+          if [[ "${{ github.event_name }}" == "push" && "${{ contains(github.event.head_commit.message, '[skip ci]') }}" == "true" ]]; then
+            echo "Skipping build as this is a commit from the workflow itself"
+            exit 0
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "Push event detected - building and pushing image"
+            
+            # Build and push to GitHub Packages
+            docker build -t ghcr.io/${{ github.repository_owner }}/${{ env.PACKAGE_NAME }}:latest .
+            docker push ghcr.io/${{ github.repository_owner }}/${{ env.PACKAGE_NAME }}:latest
+            
+            # Update the stored digest
+            mkdir -p .github
+            echo "$DOCKER_DIGEST" > .github/last-digest.txt
+          else
+            # Check if Docker image has changed
+            PREVIOUS_DIGEST="${{ steps.previous-digest.outputs.value }}"
+            echo "Current Docker image digest: $DOCKER_DIGEST"
+            echo "Previous Docker image digest: $PREVIOUS_DIGEST"
+            
+            if [ -z "$PREVIOUS_DIGEST" ] || [ "$DOCKER_DIGEST" != "$PREVIOUS_DIGEST" ]; then
+              echo "Base image has changed or this is the first run. Building new image..."
+              
+              # Build and push to GitHub Packages
+              docker build -t ghcr.io/${{ github.repository_owner }}/${{ env.PACKAGE_NAME }}:latest .
+              docker push ghcr.io/${{ github.repository_owner }}/${{ env.PACKAGE_NAME }}:latest
+              
+              # Update the stored digest
+              mkdir -p .github
+              echo "$DOCKER_DIGEST" > .github/last-digest.txt
+              
+              # Create a summary of changes
+              echo "# Base Image Update Detected" > .github/update-summary.md
+              echo "The base image \`docker.io/matrixdotorg/synapse:latest\` has been updated." >> .github/update-summary.md
+              echo "- Previous digest: \`$PREVIOUS_DIGEST\`" >> .github/update-summary.md
+              echo "- New digest: \`$DOCKER_DIGEST\`" >> .github/update-summary.md
+              echo "- Date detected: $(date)" >> .github/update-summary.md
+              echo "- New image built and pushed to: \`ghcr.io/${{ github.repository_owner }}/${{ env.PACKAGE_NAME }}:latest\`" >> .github/update-summary.md
+              
+              # Commit the updated digest file
+              git config --local user.email "github-actions@github.com"
+              git config --local user.name "GitHub Actions"
+              git add .github/last-digest.txt .github/update-summary.md
+              git commit -m "[skip ci] Build new image from base update" || echo "No changes to commit"
+              git push
+            else
+              echo "Base image has not changed. No rebuild needed."
+            fi
+          fi
